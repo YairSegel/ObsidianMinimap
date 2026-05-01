@@ -456,9 +456,11 @@ class Minimap {
         this.helperElement =
             plugin.app.workspace.getLeafById(helperLeafId)?.view?.contentEl;
         this.sourceView = element.querySelector(".markdown-source-view");
-        this.modeChange();
+        // Bind before modeChange so the scroll listener added by changeScroller
+        // gets the correctly bound reference (bug: was bound after modeChange)
         this.updateSliderScroll = this.updateSliderScroll.bind(this);
         this.onSliderMouseDown = this.onSliderMouseDown.bind(this);
+        this.modeChange();
 
         this.setupElements();
         this.updateSettings(settings);
@@ -523,7 +525,7 @@ class Minimap {
         if (this.iframe) this.iframe.style.setProperty("--scale", this.scale);
         if (this.slider) this.slider.style.setProperty("--scale", this.scale);
         if (this.slider) this.slider.style.opacity = this.sliderOpacity;
-        if (this.iframe) this.iframe.style.top = `${this.topOffset}px`;
+        // iframe top is managed dynamically by updateSliderScroll()
     }
 
     destroy() {
@@ -569,13 +571,15 @@ class Minimap {
 
     async onResize() {
         await sleep(300);
-
+        if (!this.scroller) return;
         this.resize(
-            this.scroller.firstChild.getBoundingClientRect().height,
-            this.scroller.getBoundingClientRect().height
+            this.scroller.scrollHeight,
+            this.scroller.clientHeight
         );
     }
     resize(fullHeight, visibleHeight) {
+        this._fullHeight = fullHeight;
+        this._containerHeight = visibleHeight;
         this.iframe.style.height = `${fullHeight}px`;
         this.slider.style.height = `${visibleHeight * this.scale}px`;
         this.updateSliderScroll();
@@ -601,36 +605,42 @@ class Minimap {
         container.appendChild(this.slider);
     }
 
+    _getCachedIframeStyles() {
+        const themeClass = document.body.classList.contains("theme-dark")
+            ? "theme-dark"
+            : "theme-light";
+        // Invalidate cache on theme switch
+        if (this._stylesCache && this._stylesCacheTheme === themeClass) {
+            return this._stylesCache;
+        }
+        const styleElements = Array.from(
+            document.head.querySelectorAll('style, link[rel="stylesheet"]')
+        );
+        const stylesHTML = styleElements.map((el) => el.outerHTML).join("\n");
+        const rootStyles = getComputedStyle(document.body);
+        let cssVars = ":root {\n";
+        for (let i = 0; i < rootStyles.length; i++) {
+            const prop = rootStyles[i];
+            if (prop.startsWith("--")) {
+                cssVars += `  ${prop}: ${rootStyles.getPropertyValue(prop)};\n`;
+            }
+        }
+        cssVars += "}\n::-webkit-scrollbar {display: none;}";
+        this._stylesCache = { stylesHTML, cssVars };
+        this._stylesCacheTheme = themeClass;
+        return this._stylesCache;
+    }
+
     async updateIframe(noteContent) {
         if (!noteContent) noteContent = await this.getFullHTML();
         noteContent
             .querySelectorAll(".minimap-frame, .minimap-slider")
             .forEach((el) => el.remove());
 
-        // Clone styles
-        const styleElements = Array.from(
-            document.head.querySelectorAll('style, link[rel="stylesheet"]')
-        );
-        const stylesHTML = styleElements.map((el) => el.outerHTML).join("\n");
-
         const themeClass = document.body.classList.contains("theme-dark")
             ? "theme-dark"
             : "theme-light";
-
-        const rootStyles = getComputedStyle(
-            document.documentElement.querySelector("body")
-        );
-        let cssVars = ":root {\n";
-        for (let i = 0; i < rootStyles.length; i++) {
-            const prop = rootStyles[i];
-            if (prop.startsWith("--")) {
-                const value = rootStyles.getPropertyValue(prop);
-                cssVars += `  ${prop}: ${value};\n`;
-            }
-        }
-        cssVars += "}";
-        // Remove scrollbar inside minimap
-        cssVars += "::-webkit-scrollbar {display: none;}";
+        const { stylesHTML, cssVars } = this._getCachedIframeStyles();
 
         const html = `
 		<!DOCTYPE html>
@@ -648,8 +658,26 @@ class Minimap {
     updateSliderScroll() {
         if (!this.scroller) return;
         const scrollTop = this.scroller.scrollTop;
-        const boxTop = scrollTop * this.scale + (this.topOffset || 0);
-        this.slider.style.top = `${boxTop}px`;
+        const fullHeight = this._fullHeight || this.scroller.scrollHeight;
+        const containerHeight = this._containerHeight || this.scroller.clientHeight;
+        const sliderHeight = containerHeight * this.scale;
+        const topOff = this.topOffset || 0;
+
+        // Absolute visual position of the slider if the minimap were infinitely tall
+        const sliderVisualTop = scrollTop * this.scale;
+
+        // Scroll the minimap (VS Code-style): center the slider within the
+        // visible container, clamped so the minimap never goes past its bounds
+        const minimapContentHeight = fullHeight * this.scale;
+        const maxMinimapScroll = Math.max(0, minimapContentHeight - containerHeight);
+        let minimapScroll = sliderVisualTop - containerHeight / 2 + sliderHeight / 2;
+        minimapScroll = Math.max(0, Math.min(minimapScroll, maxMinimapScroll));
+        this.minimapScroll = minimapScroll;
+
+        // Slider position within the visible container
+        this.slider.style.top = `${sliderVisualTop - minimapScroll + topOff}px`;
+        // Shift the iframe up so the correct portion of the minimap is visible
+        this.iframe.style.top = `${topOff - minimapScroll}px`;
     }
 
     // Needed since obsidian doesn't load non-visible parts of the note (can't be changed).
@@ -687,8 +715,10 @@ class Minimap {
 
         offsetY = Math.max(0, Math.min(offsetY, maxOffset));
 
-        const scrollY = offsetY / this.scale;
-        this.scroller.scrollTop = scrollY;
+        // Add current minimap scroll offset so dragging maps correctly to
+        // editor scroll position even when the minimap has scrolled
+        const scrollY = (offsetY + (this.minimapScroll || 0)) / this.scale;
+        this.scroller.scrollTop = Math.min(scrollY, maxScroll);
 
         this.updateSliderScroll(); // keep slider visually synced
     };
